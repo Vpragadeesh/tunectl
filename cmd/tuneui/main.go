@@ -706,7 +706,7 @@ func (p *player) updateProgress(track provider.Track, stopCh chan struct{}) {
 			totalSec := track.Duration % 60
 			percentage := int((elapsed / total) * 100)
 
-			progressText := fmt.Sprintf("[cyan]%s[gray]%s[-] %d%% %d:%02d / %d:%02d (%d%%)",
+			progressText := fmt.Sprintf("[aqua:black:b]%s[-:black] %s %d%% %d:%02d / %d:%02d (%d%%)",
 				filledBar, remainingBar, percentage, elapsedMin, elapsedSec, totalMin, totalSec, percentage)
 
 			p.app.QueueUpdateDraw(func() {
