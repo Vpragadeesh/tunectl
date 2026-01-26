@@ -1,9 +1,14 @@
 package mpv
 
 import (
+	"encoding/json"
 	"fmt"
+	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
+	"time"
 )
 
 // Start spawns mpv and returns the started *exec.Cmd. Caller may kill or Wait on it.
@@ -11,10 +16,13 @@ func Start(url string, title string, device string, resample bool) (*exec.Cmd, e
 	// Start mpv in audio-only mode by default for a terminal music player.
 	// Use --really-quiet to suppress all terminal output that would corrupt TUI.
 	// Use --no-terminal to prevent mpv from trying to read/write the terminal.
+	// Use --input-ipc-server for socket-based IPC control
+	socketPath := getTempSocketPath()
 	args := []string{
 		"--no-video",
 		"--no-terminal",
 		"--really-quiet",
+		fmt.Sprintf("--input-ipc-server=%s", socketPath),
 	}
 	if device != "" {
 		args = append(args, "--audio-device="+device)
@@ -60,3 +68,44 @@ func RunCapture(url string, title string, device string, resample bool) (string,
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
+
+// getTempSocketPath returns a unique socket path for mpv IPC
+func getTempSocketPath() string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("mpv-socket-%d", os.Getpid()))
+}
+
+// SendCommand sends a command to mpv via IPC socket
+func SendCommand(cmd string, args ...interface{}) error {
+	socketPath := getTempSocketPath()
+	conn, err := net.DialTimeout("unix", socketPath, 500*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Build JSON command
+	command := map[string]interface{}{
+		"command": append([]interface{}{cmd}, args...),
+	}
+	data, _ := json.Marshal(command)
+	data = append(data, '\n')
+
+	_, err = conn.Write(data)
+	return err
+}
+
+// Seek seeks to a position relative to current time (in seconds)
+func Seek(seconds float64) error {
+	return SendCommand("seek", seconds, "relative")
+}
+
+// Pause toggles pause state
+func Pause() error {
+	return SendCommand("cycle", "pause")
+}
+
+// Play resumes playback
+func Play() error {
+	return SendCommand("set", "pause", false)
+}
+

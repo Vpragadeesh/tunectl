@@ -25,28 +25,36 @@ const (
 	actionPrevious
 	actionStop
 	actionClearQueue
+	actionPlay
+	actionPause
+	actionFastForward
+	actionRewind
+	actionForceQuit
 )
 
 type player struct {
-	mu          sync.Mutex
-	queue       []provider.Track
-	queueIdx    int
-	currentCmd  *exec.Cmd
-	currentTrk  *provider.Track
-	paused      bool
-	searching   bool
-	stopSpinner chan struct{}
-	yt          provider.Provider
-	app         *tview.Application
-	nowView     *tview.TextView
-	queueView   *tview.List
-	searchView  *tview.InputField
-	resultsView *tview.List
-	helpView    *tview.TextView
-	searchRes   []provider.Track
-	focusables  []tview.Primitive
-	focusIdx    int
-	actionChan  chan action
+	mu              sync.Mutex
+	queue           []provider.Track
+	queueIdx        int
+	currentCmd      *exec.Cmd
+	currentTrk      *provider.Track
+	playbackStart   time.Time
+	paused          bool
+	searching       bool
+	stopSpinner     chan struct{}
+	stopProgress    chan struct{}
+	yt              provider.Provider
+	app             *tview.Application
+	nowView         *tview.TextView
+	progressView    *tview.TextView
+	queueView       *tview.List
+	searchView      *tview.InputField
+	resultsView     *tview.List
+	helpView        *tview.TextView
+	searchRes       []provider.Track
+	focusables      []tview.Primitive
+	focusIdx        int
+	actionChan      chan action
 }
 
 func main() {
@@ -75,6 +83,12 @@ func main() {
 	p.nowView.SetTitle(" Now Playing ")
 	p.nowView.SetText("[yellow]No track playing[-]\n\nType to search, press Enter")
 
+	p.progressView = tview.NewTextView()
+	p.progressView.SetDynamicColors(true)
+	p.progressView.SetBorder(true)
+	p.progressView.SetTitle(" Progress ")
+	p.progressView.SetText("")
+
 	p.queueView = tview.NewList().ShowSecondaryText(false)
 	p.queueView.SetBorder(true).SetTitle(" Queue [Enter=Play] ")
 	p.queueView.SetHighlightFullLine(true)
@@ -88,8 +102,9 @@ func main() {
 		"[green]Tab[-]    Next panel    [green]S-Tab[-]  Prev panel\n" +
 			"[green]Enter[-]  Play selected  [green]a[-]      Add to queue\n" +
 			"[green]n[-]      Next track     [green]p[-]      Prev track\n" +
-			"[green]s[-]      Stop           [green]c[-]      Clear queue\n" +
-			"[green]Esc[-]    Unfocus search [green]q[-]      Quit",
+			"[green]Space[-]  Play/Pause     [green]s[-]      Stop\n" +
+			"[green]→ ←[-]    Fwd/Rewind     [green]c[-]      Clear queue\n" +
+			"[green]Esc[-]    Unfocus        [green]q[-]      Force Quit",
 	)
 
 	// Track focusable items
@@ -104,7 +119,8 @@ func main() {
 
 	leftPanel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(searchBox, 3, 0, true).
-		AddItem(p.resultsView, 0, 1, false)
+		AddItem(p.resultsView, 0, 1, false).
+		AddItem(p.progressView, 3, 0, false)
 
 	rightPanel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(p.nowView, 0, 2, false).
@@ -161,7 +177,8 @@ func (p *player) setupHandlers() {
 		if idx >= 0 && idx < len(p.searchRes) {
 			track := p.searchRes[idx]
 			p.mu.Unlock()
-			p.playTrack(track)
+			// Spawn in goroutine to avoid blocking tview event loop
+			go p.playTrack(track)
 		} else {
 			p.mu.Unlock()
 		}
@@ -185,9 +202,19 @@ func (p *player) setupHandlers() {
 		case 'c', 'C':
 			p.actionChan <- actionClearQueue
 			return nil
+		case ' ':
+			p.actionChan <- actionPause
+			return nil
 		case 'q', 'Q':
-			p.cleanup()
-			p.app.Stop()
+			p.actionChan <- actionForceQuit
+			return nil
+		}
+		switch event.Key() {
+		case tcell.KeyRight:
+			p.actionChan <- actionFastForward
+			return nil
+		case tcell.KeyLeft:
+			p.actionChan <- actionRewind
 			return nil
 		}
 		return p.handleGlobalKey(event)
@@ -200,7 +227,8 @@ func (p *player) setupHandlers() {
 			track := p.queue[idx]
 			p.queueIdx = idx
 			p.mu.Unlock()
-			p.playTrack(track)
+			// Spawn in goroutine to avoid blocking tview event loop
+			go p.playTrack(track)
 		} else {
 			p.mu.Unlock()
 		}
@@ -221,9 +249,19 @@ func (p *player) setupHandlers() {
 		case 'c', 'C':
 			p.actionChan <- actionClearQueue
 			return nil
+		case ' ':
+			p.actionChan <- actionPause
+			return nil
 		case 'q', 'Q':
-			p.cleanup()
-			p.app.Stop()
+			p.actionChan <- actionForceQuit
+			return nil
+		}
+		switch event.Key() {
+		case tcell.KeyRight:
+			p.actionChan <- actionFastForward
+			return nil
+		case tcell.KeyLeft:
+			p.actionChan <- actionRewind
 			return nil
 		}
 		return p.handleGlobalKey(event)
@@ -263,6 +301,9 @@ func (p *player) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
 		p.cleanup()
 		p.app.Stop()
 		return nil
+	case tcell.KeyCtrlQ:
+		p.actionChan <- actionForceQuit
+		return nil
 	case tcell.KeyTab:
 		p.nextFocus()
 		return nil
@@ -271,13 +312,6 @@ func (p *player) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
 		return nil
 	case tcell.KeyEsc:
 		p.app.SetFocus(p.resultsView)
-		return nil
-	}
-
-	switch event.Rune() {
-	case 'q', 'Q':
-		p.cleanup()
-		p.app.Stop()
 		return nil
 	}
 
@@ -298,6 +332,16 @@ func (p *player) processActions() {
 			p.updateNowPlaying("[yellow]Stopped[-]")
 		case actionClearQueue:
 			p.clearQueue()
+		case actionPlay:
+			mpv.Play()
+		case actionPause:
+			mpv.Pause()
+		case actionFastForward:
+			mpv.Seek(10) // Skip forward 10 seconds
+		case actionRewind:
+			mpv.Seek(-10) // Rewind 10 seconds
+		case actionForceQuit:
+			p.forceQuit()
 		}
 	}
 }
@@ -467,7 +511,13 @@ func (p *player) playTrack(track provider.Track) {
 		p.mu.Lock()
 		p.currentCmd = cmd
 		p.currentTrk = &track
+		p.playbackStart = time.Now()
 		p.paused = false
+		if p.stopProgress != nil {
+			close(p.stopProgress)
+		}
+		p.stopProgress = make(chan struct{})
+		stopProgressCh := p.stopProgress
 		p.mu.Unlock()
 
 		dur := ""
@@ -476,6 +526,9 @@ func (p *player) playTrack(track provider.Track) {
 		}
 		p.updateNowPlaying(fmt.Sprintf("[green]♪ Playing:[-]\n[white]%s[-]\n[gray]%s[-]%s", track.Title, track.Artist, dur))
 		p.updateQueueView()
+
+		// Start progress bar updater
+		go p.updateProgress(track, stopProgressCh)
 
 		go func() {
 			_ = cmd.Wait()
@@ -501,11 +554,20 @@ func (p *player) stop() {
 	cmd := p.currentCmd
 	p.currentCmd = nil
 	p.currentTrk = nil
+	if p.stopProgress != nil {
+		close(p.stopProgress)
+		p.stopProgress = nil
+	}
 	p.mu.Unlock()
 
 	if cmd != nil {
 		_ = mpv.KillCmd(cmd)
 	}
+
+	// Clear progress bar
+	p.app.QueueUpdateDraw(func() {
+		p.progressView.SetText("")
+	})
 }
 
 func (p *player) next() {
@@ -580,6 +642,97 @@ func (p *player) updateQueueView() {
 func (p *player) updateNowPlaying(text string) {
 	p.app.QueueUpdateDraw(func() {
 		p.nowView.SetText(text)
+	})
+}
+
+func (p *player) updateProgress(track provider.Track, stopCh chan struct{}) {
+	if stopCh == nil || track.Duration <= 0 {
+		p.app.QueueUpdateDraw(func() {
+			p.progressView.SetText("")
+		})
+		return
+	}
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			p.mu.Lock()
+			if p.currentCmd == nil || p.currentTrk == nil {
+				p.mu.Unlock()
+				return
+			}
+			elapsed := time.Since(p.playbackStart).Seconds()
+			total := float64(track.Duration)
+			p.mu.Unlock()
+
+			// Clamp elapsed to 0-total
+			if elapsed < 0 {
+				elapsed = 0
+			}
+			if elapsed > total {
+				elapsed = total
+			}
+			// Calculate progress bar - use full width of box
+			_, _, width, _ := p.progressView.GetRect()
+			barWidth := width - 4 // Account for borders and padding
+			if barWidth < 10 {
+				barWidth = 10
+			}
+
+			progress := int((elapsed / total) * float64(barWidth))
+			if progress > barWidth {
+				progress = barWidth
+			}
+
+			// Build progress bar with colored sections
+			filledBar := ""
+			for i := 0; i < progress; i++ {
+				filledBar += "█" // Solid blocks for filled portion
+			}
+
+			remainingBar := ""
+			for i := progress; i < barWidth; i++ {
+				remainingBar += "·" // Dots for unfilled portion
+			}
+
+			elapsedMin := int(elapsed) / 60
+			elapsedSec := int(elapsed) % 60
+			totalMin := track.Duration / 60
+			totalSec := track.Duration % 60
+			percentage := int((elapsed / total) * 100)
+
+			progressText := fmt.Sprintf("[cyan]%s[gray]%s[-] %d%% %d:%02d / %d:%02d (%d%%)",
+				filledBar, remainingBar, percentage, elapsedMin, elapsedSec, totalMin, totalSec, percentage)
+
+			p.app.QueueUpdateDraw(func() {
+				p.progressView.SetText(progressText)
+			})
+		}
+	}
+}
+
+func (p *player) forceQuit() {
+	// Force quit everything within 1 second
+	go func() {
+		p.mu.Lock()
+		if p.currentCmd != nil && p.currentCmd.Process != nil {
+			// Kill the mpv process immediately
+			_ = p.currentCmd.Process.Kill()
+		}
+		p.mu.Unlock()
+		
+		// Stop the app
+		p.app.Stop()
+	}()
+	
+	// Exit forcefully after 1 second if still running
+	time.AfterFunc(1*time.Second, func() {
+		os.Exit(0)
 	})
 }
 
