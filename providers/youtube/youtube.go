@@ -224,3 +224,63 @@ func safeFloat64(v interface{}) float64 {
 		return 0
 	}
 }
+
+// FetchTracksFromURL accepts a YouTube video or playlist URL and returns one or more tracks.
+// If the URL points to a single video, a single-track slice is returned. For playlists the
+// function returns all entries found by yt-dlp's --flat-playlist JSON output. A limit <= 0
+// will use a sensible default (all entries up to 100).
+func (y *YouTubeProvider) FetchTracksFromURL(url string, limit int) ([]provider.Track, error) {
+	if limit <= 0 {
+		limit = 0 // yt-dlp will return all by default for playlists
+	}
+	cmd := getYtDlpCmd("-j", "--flat-playlist", url)
+	out, err := cmd.Output()
+	if err != nil {
+		// Try falling back to single JSON output for video URLs
+		cmd2 := getYtDlpCmd("-j", url)
+		out, err = cmd2.Output()
+		if err != nil {
+			return nil, fmt.Errorf("yt-dlp extraction failed: %w", err)
+		}
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var tracks []provider.Track
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		var meta map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &meta); err != nil {
+			continue
+		}
+		title := safeString(meta["title"])
+		uploader := safeString(meta["uploader"])
+		if uploader == "" {
+			uploader = safeString(meta["channel"])
+		}
+		duration := int(safeFloat64(meta["duration"]))
+		id := safeString(meta["id"])
+		if id == "" {
+			id = safeString(meta["url"])
+		}
+		if id == "" {
+			continue
+		}
+
+		t := provider.Track{
+			ID:       "youtube:" + id,
+			Provider: y.Name(),
+			Title:    title,
+			Artist:   uploader,
+			Duration: duration,
+			Links:    map[string]string{"youtube": fmt.Sprintf("https://www.youtube.com/watch?v=%s", id)},
+		}
+		tracks = append(tracks, t)
+	}
+
+	if len(tracks) == 0 {
+		return nil, fmt.Errorf("no tracks found for url")
+	}
+	return tracks, nil
+}

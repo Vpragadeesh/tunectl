@@ -11,7 +11,9 @@ import (
 
 	"audictl/internal/mpv"
 	"audictl/internal/provider"
+	sprov "audictl/providers/spotify"
 	yprov "audictl/providers/youtube"
+	"strings"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -33,28 +35,29 @@ const (
 )
 
 type player struct {
-	mu              sync.Mutex
-	queue           []provider.Track
-	queueIdx        int
-	currentCmd      *exec.Cmd
-	currentTrk      *provider.Track
-	playbackStart   time.Time
-	paused          bool
-	searching       bool
-	stopSpinner     chan struct{}
-	stopProgress    chan struct{}
-	yt              provider.Provider
-	app             *tview.Application
-	nowView         *tview.TextView
-	progressView    *tview.TextView
-	queueView       *tview.List
-	searchView      *tview.InputField
-	resultsView     *tview.List
-	helpView        *tview.TextView
-	searchRes       []provider.Track
-	focusables      []tview.Primitive
-	focusIdx        int
-	actionChan      chan action
+	mu            sync.Mutex
+	queue         []provider.Track
+	queueIdx      int
+	currentCmd    *exec.Cmd
+	currentTrk    *provider.Track
+	playbackStart time.Time
+	paused        bool
+	searching     bool
+	stopSpinner   chan struct{}
+	stopProgress  chan struct{}
+	yt            provider.Provider
+	app           *tview.Application
+	nowView       *tview.TextView
+	progressView  *tview.TextView
+	queueView     *tview.List
+	searchView    *tview.InputField
+	linkView      *tview.InputField
+	resultsView   *tview.List
+	helpView      *tview.TextView
+	searchRes     []provider.Track
+	focusables    []tview.Primitive
+	focusIdx      int
+	actionChan    chan action
 }
 
 func main() {
@@ -71,6 +74,24 @@ func main() {
 	p.searchView.SetLabel(" Search: ")
 	p.searchView.SetFieldWidth(0)
 	p.searchView.SetFieldBackgroundColor(tcell.ColorDarkSlateGray)
+
+	p.linkView = tview.NewInputField()
+	p.linkView.SetLabel(" Paste link: ")
+	p.linkView.SetFieldWidth(0)
+	p.linkView.SetFieldBackgroundColor(tcell.ColorDarkSlateGray)
+	p.linkView.SetDoneFunc(func(key tcell.Key) {
+		switch key {
+		case tcell.KeyEnter:
+			link := strings.TrimSpace(p.linkView.GetText())
+			if link != "" {
+				// Process in goroutine so we don't block the UI
+				go p.handleLink(link)
+				p.linkView.SetText("")
+			}
+		case tcell.KeyEsc, tcell.KeyTab, tcell.KeyBacktab:
+			// handled by global
+		}
+	})
 
 	p.resultsView = tview.NewList().ShowSecondaryText(false)
 	p.resultsView.SetBorder(true).SetTitle(" Results [Enter=Play, a=Queue] ")
@@ -104,18 +125,26 @@ func main() {
 			"[green]n[-]      Next track     [green]p[-]      Prev track\n" +
 			"[green]Space[-]  Play/Pause     [green]s[-]      Stop\n" +
 			"[green]→ ←[-]    Fwd/Rewind     [green]c[-]      Clear queue\n" +
-			"[green]Esc[-]    Unfocus        [green]q[-]      Force Quit",
+			"[green]Esc[-]    Unfocus        [green]q[-]      Force Quit\n" +
+			"\n" +
+			"[yellow]YouTube:[-] yt.be/xxx or youtube.com/...\n" +
+			"[yellow]Spotify:[-] open.spotify.com/track/xxx [gray](→ searches YouTube)[-]",
 	)
 
 	// Track focusable items
-	p.focusables = []tview.Primitive{p.searchView, p.resultsView, p.queueView}
+	p.focusables = []tview.Primitive{p.searchView, p.linkView, p.resultsView, p.queueView}
 	p.focusIdx = 0
 
 	// Layout
-	searchBox := tview.NewFlex().
-		AddItem(nil, 1, 0, false).
-		AddItem(p.searchView, 0, 1, true).
-		AddItem(nil, 1, 0, false)
+	searchBox := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(tview.NewFlex().
+			AddItem(nil, 1, 0, false).
+			AddItem(p.searchView, 0, 1, true).
+			AddItem(nil, 1, 0, false), 3, 0, true).
+		AddItem(tview.NewFlex().
+			AddItem(nil, 1, 0, false).
+			AddItem(p.linkView, 0, 1, false).
+			AddItem(nil, 1, 0, false), 3, 0, false)
 
 	leftPanel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(searchBox, 3, 0, true).
@@ -455,6 +484,69 @@ func (p *player) performSearch(query string) {
 	}()
 }
 
+// handleLink processes pasted links (YouTube/Spotify). It accepts single videos/tracks as well
+// as playlists. For playlists, all entries are added to the queue; single tracks are played
+// (YouTube) or added to the queue (Spotify metadata, DRM).
+func (p *player) handleLink(link string) {
+	link = strings.TrimSpace(link)
+	if link == "" {
+		return
+	}
+
+	// YouTube links (video or playlist)
+	if strings.Contains(link, "youtube.com") || strings.Contains(link, "youtu.be") {
+		y := yprov.New()
+		tracks, err := y.FetchTracksFromURL(link, 0)
+		if err != nil {
+			p.updateNowPlaying(fmt.Sprintf("[red]Link error:[-] %v", err))
+			return
+		}
+		if len(tracks) == 0 {
+			p.updateNowPlaying("[yellow]No tracks found in link[-]")
+			return
+		}
+		if len(tracks) == 1 {
+			go p.playTrack(tracks[0])
+			return
+		}
+		p.mu.Lock()
+		p.queue = append(p.queue, tracks...)
+		p.mu.Unlock()
+		p.updateQueueView()
+		p.updateNowPlaying(fmt.Sprintf("[green]+ Added playlist:[-] %d tracks", len(tracks)))
+		return
+	}
+
+	// Spotify links (track or playlist)
+	if strings.Contains(link, "spotify.com") {
+		sp := sprov.New()
+		tracks, err := sp.FetchTracksFromURL(link)
+		if err != nil {
+			p.updateNowPlaying(fmt.Sprintf("[red]Spotify error:[-] %v", err))
+			return
+		}
+		if len(tracks) == 0 {
+			p.updateNowPlaying("[yellow]No tracks found in Spotify link[-]")
+			return
+		}
+
+		// Add all tracks to queue (don't auto-play Spotify due to auth requirements)
+		p.mu.Lock()
+		p.queue = append(p.queue, tracks...)
+		p.mu.Unlock()
+		p.updateQueueView()
+
+		if len(tracks) == 1 {
+			p.updateNowPlaying(fmt.Sprintf("[yellow]⚠ Spotify added (requires premium + auth):[-]\n%s", tracks[0].Title))
+		} else {
+			p.updateNowPlaying(fmt.Sprintf("[yellow]⚠ Spotify added (requires premium + auth):[-]\n%d items", len(tracks)))
+		}
+		return
+	}
+
+	p.updateNowPlaying("[yellow]Unsupported link type[-]")
+}
+
 func (p *player) playTrack(track provider.Track) {
 	p.stop()
 
@@ -725,11 +817,11 @@ func (p *player) forceQuit() {
 			_ = p.currentCmd.Process.Kill()
 		}
 		p.mu.Unlock()
-		
+
 		// Stop the app
 		p.app.Stop()
 	}()
-	
+
 	// Exit forcefully after 1 second if still running
 	time.AfterFunc(1*time.Second, func() {
 		os.Exit(0)

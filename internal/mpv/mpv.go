@@ -108,4 +108,3 @@ func Pause() error {
 func Play() error {
 	return SendCommand("set", "pause", false)
 }
-
