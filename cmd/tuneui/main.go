@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,6 +19,18 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
+
+// urlList is a simple flag.Value to collect multiple --url / -u flags
+type urlList []string
+
+func (u *urlList) String() string {
+	return strings.Join(*u, ",")
+}
+
+func (u *urlList) Set(value string) error {
+	*u = append(*u, value)
+	return nil
+}
 
 type action int
 
@@ -61,6 +74,12 @@ type player struct {
 }
 
 func main() {
+	// Parse startup flags
+	var urls urlList
+	flag.Var(&urls, "url", "URL to open on startup (may be repeated)")
+	flag.Var(&urls, "u", "shorthand for --url")
+	flag.Parse()
+
 	app := tview.NewApplication()
 	p := &player{
 		queue:      []provider.Track{},
@@ -170,6 +189,86 @@ func main() {
 
 	// Start action processor
 	go p.processActions()
+
+	// If startup URLs were provided, process them shortly after initialization.
+	// Behavior: multiple occurrences allowed. Single-track single-URL will play immediately.
+	if len(urls) > 0 {
+		go func() {
+			// Small delay to ensure UI has initialised enough for updates
+			time.Sleep(150 * time.Millisecond)
+			for i, link := range urls {
+				link = strings.TrimSpace(link)
+				if link == "" {
+					continue
+				}
+
+				// Debug print so CLI users see what's happening on startup
+				fmt.Fprintf(os.Stderr, "startup: processing url [%d]: %s\n", i+1, link)
+
+				// YouTube
+				if strings.Contains(link, "youtube.com") || strings.Contains(link, "youtu.be") {
+					y := yprov.New()
+					tracks, err := y.FetchTracksFromURL(link, 0)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "startup: youtube extraction error: %v\n", err)
+						p.updateNowPlaying(fmt.Sprintf("[red]Link error:[-] %v", err))
+						continue
+					}
+					fmt.Fprintf(os.Stderr, "startup: youtube returned %d tracks\n", len(tracks))
+					if len(tracks) == 0 {
+						p.updateNowPlaying("[yellow]No tracks found in link[-]")
+						continue
+					}
+					// If single URL and single track, auto-play
+					if len(tracks) == 1 && len(urls) == 1 {
+						go p.playTrack(tracks[0])
+						continue
+					}
+					p.mu.Lock()
+					p.queue = append(p.queue, tracks...)
+					p.mu.Unlock()
+					p.updateQueueView()
+					p.updateNowPlaying(fmt.Sprintf("[green]+ Added playlist:[-] %d tracks", len(tracks)))
+					continue
+				}
+
+				// Spotify
+				if strings.Contains(link, "spotify.com") {
+					fmt.Fprintf(os.Stderr, "startup: spotify url -> %s\n", link)
+					sp := sprov.New()
+					tracks, err := sp.FetchTracksFromURL(link)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "startup: spotify extraction error: %v\n", err)
+						p.updateNowPlaying(fmt.Sprintf("[red]Spotify error:[-] %v", err))
+						continue
+					}
+					fmt.Fprintf(os.Stderr, "startup: spotify returned %d tracks\n", len(tracks))
+					if len(tracks) == 0 {
+						p.updateNowPlaying("[yellow]No tracks found in Spotify link[-]")
+						continue
+					}
+					if len(tracks) == 1 && len(urls) == 1 {
+						go p.playTrack(tracks[0])
+						continue
+					}
+					p.mu.Lock()
+					p.queue = append(p.queue, tracks...)
+					p.mu.Unlock()
+					p.updateQueueView()
+					if len(tracks) == 1 {
+						p.updateNowPlaying(fmt.Sprintf("[green]+ Added:[-] %s", tracks[0].Title))
+					} else {
+						p.updateNowPlaying(fmt.Sprintf("[green]+ Added playlist:[-] %d items", len(tracks)))
+					}
+					continue
+				}
+
+				// Unsupported
+				p.updateNowPlaying("[yellow]Unsupported link type[-]")
+				_ = i
+			}
+		}()
+	}
 
 	// Handle system signals
 	go func() {
